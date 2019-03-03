@@ -1,0 +1,1222 @@
+---
+title: "DA3 - assignment 1"
+author: "Szabolcs Kerekes"
+date: "19/01/2019"
+output:
+  html_document: default
+  word_document: default
+---
+## Summary of findings
+The analysis focused on estimating price prediction models for Hackney (A) and Manchester (B). The process involced scratching the dataset from scratch and estimating OLS, LASSO, post-LASSO OLS, CART and random forest models for price predictions. The approach to the two parts of the assignment is similar from a coding and cleaning perspective, due to the two overlaps in the two datasets, which resulted in the selection of close to the same variables for the final models.
+
+Part A) For the Hackney predicition our final model is a random forest model, which generated the below results. The model has the following characteristics on the Hackney dataset: BIC - 372,022.9, RMSE - 56.22, MAE - 32.16, minimum node size of 5 and a random sampling of 3 variables at each split. Our decision to use this model was based on comparing BICs of different model formats, out of which the random forest model produced the lowest BIC. Our modelling approach was to use the data from the inner districts of London for the basis of our model, assuming that the guests would visit these districts if not Hackney, thus they are the most comparable.
+
+Part B) For the Manchester predicition our final model is also a random forest model, which generated the below results. The model has the following characteristics on the Hackney dataset: BIC – 507,456.7, RMSE – 53.85, MAE – 30.98, minimum node size of 5 and a random sampling of 3 variables at each split. Our decision to use this model was based on comparing BICs of different model formats, out of which the random forest model produced the lowest BIC. In this part we used data from London and Bristol. One shortcoming of this model is that the cities for which data is available are richer than Manchester, with Bristol being still the closest in economic terms.
+
+## Setting up the environment
+
+```{r setup, results="hide", message=F}
+library(tidyverse) # this package is used for data transformation
+library(ggplot2) # this package is used for visualising data
+library(rattle) # this package relates to modelling
+library(caret) # this package is used for modelling
+library(ranger) # this package is used running models
+library(pdp) # this package relates to modelling
+library(skimr) # this package is used for summary statistics
+library(qdapTools) # this package is used for value transformation
+library(lattice) # this package relates to modelling
+library(glmnet) # this package relates to modelling
+source("~/Documents/CEU/DA3/lab2/code/Ch14_airbnb_prediction_functions.R") # we use this for finding interactions
+source("~/Documents/CEU/DA3/lab2/code/da_helper_functions.R") # we use this for RMSE calculation
+```
+
+## Part A)
+In the following we will create a model for Hackney.
+
+## Loading data 
+As a first step we filter for the business requirements, which are 1-6 guests and apartment as property type. 
+
+```{r loading data, results="hide"}
+london_data_raw <- read.csv('london_listings.csv')
+
+glimpse(london_data_raw)
+
+length(unique(london_data_raw$listing_url)) # no duplicate observations
+
+### Filtering for the business objective (1-6 guests and apartments only)
+
+london_data_raw <- london_data_raw %>% filter(accommodates < 7) 
+
+property_types <- london_data_raw %>% #we will keep Apartment, Serviced apartment, Condominium, and Loft
+  group_by(property_type) %>% 
+  summarize(count = n()) %>% 
+  arrange(-count) 
+
+rm(property_types)
+
+london_data_raw <- london_data_raw %>% filter(property_type %in% c("Apartment", "Serviced apartment", "Condominium", "Loft")) 
+
+write_csv(london_data_raw, "london_data_raw.csv")
+```
+
+## Dataset cleaning
+As the next step we move to cleaning the data via converting variables to proper types and selecting only what could have relevence for the model. The most important steps in the below code chunk include:
+1) Intitial selection of variables based on domain knowledge.
+2) Filtering data for the inner London districts assuming that for the targeted customer group would look for an apartment in the central area otherwise (Hackney is also in central London).
+3) Transforming the amenities into variables.
+4) Transforming certain variables into proper dummies.
+5) Checking NAs in the dataset and making further adjusments to variables with NA values. In the case of factor. variables in some cases we will take NA as a distinct value representing not disclosed, given that in these cases (e.g. review scores) the lack of disclosure can contain information for the customer and thus affect pricing.
+
+```{r data cleaning 1, warning=F, error=F}
+london_data <- london_data_raw %>% # selecting variables that seem to have relevance for the price
+  select(id, host_response_time, host_has_profile_pic, host_identity_verified,
+         neighbourhood_cleansed, property_type, room_type, accommodates, bathrooms, bedrooms, beds, bed_type, amenities,
+         square_feet, price, security_deposit, cleaning_fee, minimum_nights, availability_30,
+         availability_60, availability_90, availability_365, number_of_reviews, review_scores_rating, review_scores_accuracy,
+         review_scores_cleanliness, review_scores_cleanliness, review_scores_checkin, review_scores_communication, review_scores_communication,
+         review_scores_location, review_scores_value, requires_license, instant_bookable, is_business_travel_ready, cancellation_policy,
+         require_guest_profile_picture, require_guest_phone_verification)
+
+# We will assume that the customers who would be staying in Hackney would otherwise stay in any of the central london districts
+#sort(unique(london_data$neighbourhood_cleansed))
+
+london_data <- london_data %>% 
+  filter(neighbourhood_cleansed %in% c("Greenwich", "Hackney", "Hammersmith and Fulham", "Islington", "Kensington and Chelsea", "Lambeth", "Lewisham", "Southwark", "Tower Hamlets", "Wandsworth", "Westminster"))
+
+# Amenities need to be turned into proper dummies, so first we clean the names
+london_data <- london_data %>% 
+  mutate(amenities = as.character(amenities))
+
+london_data$amenities <- substring(london_data$amenities, 2, nchar(london_data$amenities)-1)
+
+london_data$amenities <- (strsplit(as.character((gsub('"', '', london_data$amenities))), ","))
+
+london_data_withdummies <- cbind(london_data, mtabulate(london_data$amenities))
+
+c <- colnames(london_data_withdummies) # We standardize the names for easy reference
+c <- c[37:length(c)]
+d <- paste("n", c, sep = "_")
+d <- gsub(" ", "_", d)
+d <- gsub("-", "_", d)
+d <- gsub("/", "_", d)
+d <- gsub(":", "_", d)
+d <- gsub("\\(", "_", d)
+d <- gsub(")", "_", d)
+d <- gsub("’", "_", d)
+d <- gsub("\\.", "_", d)
+e <- c(colnames(london_data_withdummies)[0:36], d)
+
+colnames(london_data_withdummies) <- e
+
+filter_amen <- paste(d, "<=", 1)
+
+#sapply(select(london_data_withdummies, contains("n_"), -contains("cancellation_policy")), function (x) sum(ifelse(x > 1, 1, 0)))
+
+# for some reason certain amenities have values other than 0 and 1, so we take these out
+
+london_data_withdummies_upd <- london_data_withdummies
+
+for (i in 1:length(filter_amen)){ 
+  london_data_withdummies_upd <- london_data_withdummies_upd %>% 
+    filter(eval(parse(text = filter_amen[i])))
+}
+
+amenities <- sort(sapply(select(london_data_withdummies, 
+                                contains("n_"), -contains("cancellation_policy")), 
+                         function(x) sum(x)) / nrow(london_data_withdummies) * 100) 
+
+sel_amenities <- amenities[(amenities > 5 & amenities < 95)] # excluding variables that are over or underrepresented
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>%
+  select(one_of(c(colnames(london_data), names(sel_amenities))), -amenities, -contains("translation_missing")) 
+
+#glimpse(london_data_withdummies_upd)
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% # transforming the variables into dummies and integers
+  mutate(price = as.integer(substring(price, 2)),
+                                       security_deposit = as.integer(substring(security_deposit, 2)),
+                                       cleaning_fee = as.integer(substring(cleaning_fee, 2)),
+         requires_license = as.integer(ifelse(requires_license == "f", 0, ifelse(requires_license == "t", 1, "NA"))),
+         instant_bookable = as.integer(ifelse(instant_bookable == "f", 0, ifelse(instant_bookable == "t", 1, "NA"))),
+         is_business_travel_ready = as.integer(ifelse(is_business_travel_ready == "f", 0, ifelse(is_business_travel_ready == "t", 1, "NA"))),
+         require_guest_profile_picture = as.integer(ifelse(require_guest_profile_picture == "f", 0, ifelse(require_guest_profile_picture == "t", 1, "NA"))),
+         require_guest_phone_verification = as.integer(ifelse(require_guest_phone_verification == "f", 0, ifelse(require_guest_phone_verification == "t", 1, "NA"))))
+         
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% filter(price > 0) # keeping only data with non-zero price
+
+### Check for NAs
+to_filter <- sapply(london_data_withdummies_upd, function(x) sum(is.na(x)))
+to_filter[to_filter > 0] # it seems like there are many NAs in review scores, security deposit and cleaning fee; 
+                         # NAs in bathrooms, bedrooms, beds will be dropped, square feet will not be used
+
+london_data_withdummies_upd %>% mutate(review_scores_aggreg = 1/6 * (review_scores_accuracy +
+                                                                       review_scores_cleanliness +
+                                                                       review_scores_checkin +
+                                                                       review_scores_communication +
+                                                                       review_scores_location +
+                                                                       review_scores_value),
+                                       has_review_score = ifelse(review_scores_aggreg == "NA", 0, 1)) %>%
+  group_by(has_review_score) %>%
+  summarize(price = mean(price, na.rm = T), count = n()) # it seems that could be a difference based on the presence of review scores in price
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% mutate(review_scores_aggreg = 1/6 * (review_scores_accuracy +
+                                                                       review_scores_cleanliness +
+                                                                       review_scores_checkin +
+                                                                       review_scores_communication +
+                                                                       review_scores_location +
+                                                                       review_scores_value))
+
+summary(london_data_withdummies_upd$review_scores_aggreg) # seems like the distribution has a long left tail
+
+london_data_withdummies_upd %>% mutate(has_cleaning_fee = ifelse(cleaning_fee == "NA", 0, 1)) %>%
+  group_by(has_cleaning_fee) %>%
+  summarize(price = mean(price, na.rm = T), count = n()) # interestingly an extra cleaning fee means higher price for the listing
+
+summary(london_data_withdummies_upd$cleaning_fee) # will use this for the factor variable
+
+london_data_withdummies_upd %>% mutate(has_security_deposit = ifelse(security_deposit == "NA", 0, 1)) %>%
+  group_by(has_security_deposit) %>%
+  summarize(price = mean(price, na.rm = T), count = n()) # the places with security deposit also seem to have a higher price
+
+summary(london_data_withdummies_upd$security_deposit) # will use this for the factor variable
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% 
+  mutate(review_scores_fact = cut(review_scores_aggreg, c(0, 9.333, 9.667, 9.75, Inf), c("bad", "below average", "above average", "good")), # scores turned into factors
+         cleaning_fee_fact = cut(cleaning_fee, c(0, 19, 30, 60, Inf), c("low", "below average", "above average", "high")),
+         security_deposit_fact = cut(security_deposit, c(0, 100, Inf), c("below average", "above average")),
+         availability_aggreg = cut(1/4 * (availability_30 / 30 + availability_60 / 60 + availability_90 / 90 + availability_365 / 365), c(0, 0.25, 0.5, 0.75, Inf), c("low", "below average", "above average", "high"))) # availability turned into one variable that favours imminent availability
+
+#glimpse(london_data_withdummies_upd)
+
+# we believe that the missing values for the following factors contain information relevant for price, thus we rephrase them into factor values
+
+london_data_withdummies_upd$review_scores_fact <- as.character(london_data_withdummies_upd$review_scores_fact)
+london_data_withdummies_upd$review_scores_fact[is.na(london_data_withdummies_upd$review_scores_fact) == 1] <- "no reviews"
+london_data_withdummies_upd$review_scores_fact <- as.factor(london_data_withdummies_upd$review_scores_fact)
+
+london_data_withdummies_upd$cleaning_fee_fact <- as.character(london_data_withdummies_upd$cleaning_fee_fact)
+london_data_withdummies_upd$cleaning_fee_fact[is.na(london_data_withdummies_upd$cleaning_fee_fact) == 1] <- "no fee"
+london_data_withdummies_upd$cleaning_fee_fact <- as.factor(london_data_withdummies_upd$cleaning_fee_fact)
+
+london_data_withdummies_upd$security_deposit_fact <- as.character(london_data_withdummies_upd$security_deposit_fact)
+london_data_withdummies_upd$security_deposit_fact[is.na(london_data_withdummies_upd$security_deposit_fact) == 1] <- "no fee"
+london_data_withdummies_upd$security_deposit_fact <- as.factor(london_data_withdummies_upd$security_deposit_fact)
+
+london_data_withdummies_upd$availability_aggreg <- as.character(london_data_withdummies_upd$availability_aggreg)
+london_data_withdummies_upd$availability_aggreg[is.na(london_data_withdummies_upd$availability_aggreg) == 1] <- "not disclosed"
+london_data_withdummies_upd$availability_aggreg <- as.factor(london_data_withdummies_upd$availability_aggreg)
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% # dropping other NA values
+  filter(is.na(bathrooms) == 0 & is.na(bedrooms) == 0 & is.na(beds) == 0 & is.na(price) == 0) 
+
+write_csv(london_data_withdummies_upd, "london_data_with_dummies.csv")
+```
+
+## Further cleaning steps
+We continue cleaning with the other factor variables and doing additional transformations and new variable creation based distributions. As a last cleaning step we separate the dataset into two parts with the first part including Hackney, and the second part excluding Hackney.
+
+```{r data cleaning 2, warning=F, error=F}
+#london_data_withdummies_upd %>% 
+#  select_if(is.factor) %>% 
+#  skim() # taking a quick look of all the factor variables
+
+london_data_withdummies_upd %>% 
+  group_by(bed_type) %>% 
+  summarize(count = n()) # we will not use bed_type as a variable given that there is not much variation (1% is non real bed)
+
+london_data_withdummies_upd %>% 
+  group_by(cancellation_policy) %>% 
+  summarize(count = n()) # we will group up the strict categories into one category
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% 
+  mutate(cancellation_policy = as.factor(ifelse(cancellation_policy == "flexible", "flexible", ifelse(cancellation_policy == "moderate", "moderate", "strict"))))
+
+# we will not use host_has_profile_pic given that it's almost all true
+
+# host_identity_verified needs to be turned into a dummy
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% 
+  mutate(host_identity_verified = as.integer(ifelse(host_identity_verified == "t", 1, 0)))
+
+london_data_withdummies_upd %>% 
+  group_by(host_response_time) %>% 
+  summarize(count = n()) %>% 
+  arrange(-count) # we will compile this in fewer groups for the sake of simplicity, assuming a difference between rapid and non-rapid response and no-response (N/A)
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% 
+  mutate(host_response_time = as.factor(ifelse(host_response_time == "N/A", "N/A", ifelse(host_response_time == "within an hour", "less than an hour", "more than an hour"))))
+
+#glimpse(london_data_withdummies_upd)
+
+#length(london_data_withdummies_upd$beds[london_data_withdummies_upd$beds == 0 | london_data_withdummies_upd$bathrooms == 0.0]) # we will take out the observations with 0 beds and 0 bathrooms as they are hard to interpret
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% filter(beds != 0 & bathrooms != 0.0)
+
+hist(london_data_withdummies_upd$bathrooms) # transform it into categories 1/2/3/3+
+#sort(unique(london_data_withdummies_upd$bathrooms))
+
+hist(london_data_withdummies_upd$accommodates) # add a log variable as well
+
+hist(london_data_withdummies_upd$bedrooms) # transform it into categories 0/1/2/2+
+
+hist(london_data_withdummies_upd$beds) # add a log variable as well
+
+hist(london_data_withdummies_upd$price) # add a log variable as well
+
+hist(london_data_withdummies_upd$minimum_nights) # more than 30 minimum nights seem too much so we drop those and turn into categories 1/3/7/7+
+
+#sort(unique(london_data_withdummies_upd$minimum_nights))
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% filter(minimum_nights < 15)
+
+london_data_withdummies_upd <- london_data_withdummies_upd %>% mutate(bathrooms = cut(bathrooms, c(0,1,2,3,Inf), c("1", "1-2", "2-3", "3+")),
+                                       bedrooms = cut(bedrooms, c(-Inf,0,1,2,Inf), c("0", "0-1", "1-2", "2+")),
+                                       ln_price = log(price),
+                                       ln_beds = log(beds),
+                                       ln_accommodates = log(accommodates),
+                                       minimum_nights = cut(minimum_nights, c(0,1,3,7, Inf), c("1", "1-3", "3-7", "7+")))
+
+sapply(select(london_data_withdummies_upd, requires_license, instant_bookable, is_business_travel_ready, require_guest_profile_picture, require_guest_phone_verification), function (x) sum(x)) # we will keep only instant bookable
+
+#sort(sapply(select(london_data_withdummies_upd, # checking again for amenities with too high or too low share
+#                   contains("n_"), -contains("cancellation_policy"), -ln_price, -ln_accommodates), 
+#            function(x) sum(x)) / nrow(london_data_withdummies_upd) * 100) #take out Wide doorway, Step free access and Single level home
+
+london_data_cleaned <- london_data_withdummies_upd %>% select(id,starts_with("host"),-host_has_profile_pic, neighbourhood_cleansed,room_type, accommodates, ln_accommodates, bathrooms, bedrooms, beds, ln_beds, price, ln_price, minimum_nights, instant_bookable, cancellation_policy, review_scores_fact, cleaning_fee_fact, security_deposit_fact, availability_aggreg, starts_with("n_"), -n_Other, -n_Step_free_access, -n_Single_level_home, - n_Wide_doorway) 
+
+write_csv(london_data_cleaned, "london_data_cleaned.csv")
+
+london_hackney <- london_data_cleaned %>% filter(neighbourhood_cleansed == "Hackney")
+
+write_csv(london_hackney, "london_hackney_cleaned.csv")
+
+london_ex_hackney <- london_data_cleaned %>% filter(neighbourhood_cleansed != "Hackney")
+
+write_csv(london_ex_hackney, "london_ex_hackney_cleaned.csv")
+```
+
+## Modelling ##
+Now we move to the modelling and prediction phase. In this part we estimate OLS, LASSO, post-LASSO OLS, CART and random forest models, select the best model based on BIC and use it to forecast prices in Hackney.
+
+## Modell setup ##
+First we check possible interactions, select the variables and set the training/test set and cross validation parameters. We also define a custom function for calculating BIC values for linear and log models.
+
+```{r model setup, warning=F, error=F}
+# we look at possible interactions based on domain knowledge
+
+p1 <- price_diff_by_variables(london_ex_hackney, "room_type", "n_Long_term_stays_allowed")
+p2 <- price_diff_by_variables(london_ex_hackney, "review_scores_fact", "n_Heating")
+p3 <- price_diff_by_variables(london_ex_hackney, "host_response_time", "n_Host_greets_you")
+p4 <- price_diff_by_variables(london_ex_hackney, "cancellation_policy", "n_24_hour_check_in")
+
+grid.arrange(p1, p2, p3, p4, ncol=2, nrow=2) # based on this we will include the interaction between room type and long term stay, as well as cancellation and 24 hour check-in
+
+vars_lev <- c("accommodates", "beds")
+vars_log <- c("ln_accommodates", "ln_beds")
+vars_factor <- c("room_type", "bathrooms", "bedrooms", "minimum_nights", "cancellation_policy")
+vars_additional <- c("host_response_time", "host_identity_verified", "review_scores_fact", "cleaning_fee_fact", "security_deposit_fact", "availability_aggreg", "instant_bookable")
+vars_amenities <- names(london_ex_hackney)[startsWith(names(london_ex_hackney), "n_")]
+vars_interactions <- c("room_type * n_Long_term_stays_allowed", "cancellation_policy * n_24_hour_check_in")
+model_prefix <- c("price ", "ln_price")
+
+lev1model <- paste0("price ~ ",paste(vars_lev,collapse = " + "))
+lev2model <- paste0("price ~ ",paste(c(vars_lev, vars_factor),collapse = " + "))
+lev3model <- paste0("price ~ ",paste(c(vars_lev, vars_factor, vars_additional),collapse = " + "))
+lev4model <- paste0("price ~ ",paste(c(vars_lev, vars_factor, vars_additional, vars_interactions),collapse = " + "))
+lev5model <- paste0("price ~ ",paste(c(vars_lev, vars_factor, vars_additional, vars_interactions, vars_amenities),collapse = " + "))
+lev_models <- as.list(c(lev1model, lev2model, lev3model, lev4model, lev5model))
+
+log1model <- paste0("ln_price ~ ",paste(vars_log,collapse = " + "))
+log2model <- paste0("ln_price ~ ",paste(c(vars_log, vars_factor),collapse = " + "))
+log3model <- paste0("ln_price ~ ",paste(c(vars_log, vars_factor, vars_additional),collapse = " + "))
+log4model <- paste0("ln_price ~ ",paste(c(vars_log, vars_factor, vars_additional, vars_interactions),collapse = " + "))
+log5model <- paste0("ln_price ~ ",paste(c(vars_log, vars_factor, vars_additional, vars_interactions, vars_amenities),collapse = " + "))
+log_models <- as.list(c(log1model, log2model, log3model, log4model, log5model))
+
+ols_models <- c(lev_models, log_models)
+
+basic_models <- length(vars_lev)
+adv1_models <- basic_models + length(vars_factor)
+adv2_models <- adv1_models + length(vars_additional)
+adv3_models <- adv2_models + length(vars_interactions)
+full_models <- adv3_models + length(vars_amenities)
+all_sizes <- c(basic_models, adv1_models, adv2_models, adv3_models, full_models)
+
+### Defining train and test datasets and cross-validation
+set.seed(42)
+train_indices <- createDataPartition(london_ex_hackney$price, p = 0.8, list = FALSE) # we do the below on the dataset that does not contain Hackney
+data_train <- london_ex_hackney[train_indices, ] 
+data_holdout <- london_ex_hackney[-train_indices, ]
+
+train_control <- trainControl(method = "cv", number = 10, verboseIter = F) # setting cross-validation to 10-fold
+
+# BIC calculator for log models
+get_bic_log <- function(x, y){
+  # we use "n + n * log(2 * pi) + n * log(rss0/n) + log(n) * 2" based on http://www.stat.wisc.edu/courses/st333-larget/aic.pdf
+  set.seed(42)
+  data_train_temp <- data_train
+  data_train_temp <- data_train_temp %>% 
+    mutate(predicted_ln_price = predict(x, newdata = data_train_temp), predicted_price = exp(predicted_ln_price) * exp(sd(predicted_ln_price)^2/2)^2)
+ BIC_log = nrow(data_train_temp) + nrow(data_train_temp) * log(2 * pi) + nrow(data_train_temp) * log(sum((data_train_temp$price - data_train_temp$predicted_price) ^ 2) / nrow(data_train_temp)) + log(nrow(data_train_temp)) * 2
+  
+  return(BIC_log)
+}
+
+# BIC calculator for linear models
+get_bic_lin <- function(x, y){
+  # we use "n + n * log(2 * pi) + n * log(rss0/n) + log(n) * 2" based on http://www.stat.wisc.edu/courses/st333-larget/aic.pdf
+  set.seed(42)
+  data_train_temp <- data_train
+  data_train_temp <- data_train_temp %>% 
+    mutate(predicted_price = predict(x, newdata = data_train_temp))
+  BIC_log = nrow(data_train_temp) + nrow(data_train_temp) * log(2 * pi) + nrow(data_train_temp) * log(sum((data_train_temp$price - data_train_temp$predicted_price) ^ 2) / nrow(data_train_temp)) + log(nrow(data_train_temp)) * 2
+  
+  return(BIC_log)
+}
+```
+
+## Start with OLS
+First we define a formula for OLS that we can use for each model as well as in section B of the assignment. Furthermore, we define another formula to calculate comparable RMSE values for log models, in order to compare them with level models. 
+
+```{r OLS, echo=T}
+ols_modeller <- function(x) {
+  set.seed(42)
+  data_train_temp <- data_train
+  model_name <- as.character(x)
+  model <- train(
+    formula(model_name),
+    data = data_train,
+    method = "lm",
+    trControl = train_control)
+  list_res <- model
+  return(list_res)
+}
+
+ols_logs <- function(x) {
+  set.seed(42)
+  data_train_temp <- data_train
+    data_train_temp <- data_train_temp %>% 
+    mutate(predicted_ln_price = predict(x, newdata = data_train_temp), predicted_price = exp(predicted_ln_price) * exp(sd(predicted_ln_price)^2/2)^2)
+  new_mse <- mse_log(data_train_temp$predicted_ln_price, data_train_temp$ln_price, sd(data_train_temp$predicted_ln_price))
+  new_RMSE <- new_mse ^ 0.5
+  new_MAE <- mean(abs(data_train_temp$predicted_price - data_train_temp$price))
+  list_res <- c(new_mse = new_mse, new_RMSE = new_RMSE, new_MAE = new_MAE)
+  return(list_res)
+}
+
+ols_results <- NULL
+ols_log_extra <- NULL
+ols_results <- as.list(ols_results)
+ols_log_extra <- as.list(ols_log_extra)
+y <- 1
+
+for (i in 1:length(ols_models)){
+  sys_time_start <- Sys.time()
+  ols_results[[i]]<- ols_modeller(ols_models[[i]])
+  if (startsWith(as.character(ols_models[[i]]), "ln") == 1){
+    ols_log_extra[[y]] <- ols_logs(ols_results[[i]])
+    y <- y + 1
+    #print(y)
+  }
+  sys_time_end <- Sys.time()
+  print(difftime(sys_time_end, sys_time_start))
+}
+
+ols_log_extra <- data.frame(matrix(unlist(ols_log_extra), nrow=5, byrow=T))
+colnames(ols_log_extra) <- c("MSE", "RMSE", "MAE")
+
+resamples(
+  list(
+    ols_lev1 = ols_results[[1]],
+    ols_lev2 = ols_results[[2]],
+    ols_lev3 = ols_results[[3]],
+    ols_lev4 = ols_results[[4]],
+    ols_lev5 = ols_results[[5]]
+  )
+) %>% summary() # check RMSE for linear models
+
+ols_log_extra # and for log models
+
+BICs_lin <- NULL
+
+for (models in 1:5){
+  BICs_lin[models] <- get_bic_lin(ols_results[[models]], all_sizes[models])
+}
+
+BICs <- matrix(c(c("lin1", "lin2", "lin3", "lin4", "lin5"), BICs_lin), nrow = 5, ncol = 2)
+
+colnames(BICs) <- c("model_name", "BIC")
+
+BICs_log <- NULL
+
+for (models in 1:5){
+  BICs_log[models] <- get_bic_log(ols_results[[models + 5]], all_sizes[models])
+}
+
+BICs <- rbind(BICs, matrix(c(c("log1", "log2", "log3", "log4", "log5"), BICs_log), nrow = 5, ncol = 2))
+
+BICs # select best model which is lin5
+
+BICs <- BICs[5, ]
+```
+
+Based on the results we see that linear model #5 has the lowest BIC value, thus we choose this out of the 10 models.
+
+## Continue with LASSO
+We move on to LASSO, which we expect to tell us the variables we should use in the OLS. Again, we set up a function to use LASSO efficiently in the second part.
+
+```{r LASSO, echo=T}
+lasso_model_name <- ols_models[[5]]
+
+lasso_modeller <- function(x) {
+  sys_time_start <- Sys.time()
+  
+  tune_grid <- expand.grid("alpha" = c(1), "lambda" = seq(0.05, 1, by = 0.05))
+
+  set.seed(42)
+
+  lasso_model <- train(
+    formula(as.character(x)),
+    data = data_train,
+    method = "glmnet",
+    preProcess = c("center", "scale"),
+    tuneGrid =  tune_grid,
+    trControl = train_control
+  )
+  sys_time_end <- Sys.time()
+  print(difftime(sys_time_end, sys_time_start))
+  return(lasso_model)
+}
+
+lasso_model <- lasso_modeller(lasso_model_name)
+
+resamples(
+  list(
+    ols_lev5 = ols_results[[5]],
+    lasso_model = lasso_model
+  )
+) %>% summary()
+
+lasso_bic <- get_bic_lin(lasso_model, all_sizes[5])
+
+BICs <- rbind(BICs, matrix(c(c("lasso"), lasso_bic), nrow = 1, ncol = 2))
+
+BICs # Lasso shows somewhat lower BIC score
+```
+
+Surprisingly, the lasso model has a worse BIC than linear model 5, however RMSE is somewhat better. 
+
+## Post-LASSO OLS 
+Now we estimate an OLS based on the LASSO coefficients. We do this via the OLS function. 
+
+```{r post-lasso OLS, echo=T}
+lasso_coeffs <- coef(
+  lasso_model$finalModel, 
+  lasso_model$bestTune$lambda) %>%
+  as.matrix() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "variable") %>% 
+  rename(coefficient = `1`)
+
+#print(lasso_coeffs) # we will add an additional linear regression model based on the coefficients 
+
+counter = 1
+vars_amenities_upd <- NULL
+
+for (names in (1:length(vars_amenities))){
+  if (vars_amenities[names] %in% c("n_Cable_TV", "n_Dishes_and_silverware") == 0) {
+    vars_amenities_upd[counter] <- vars_amenities[names]
+    counter <- counter + 1
+  }
+}
+
+lin_postlasso_model <- paste0("price ~ ",paste(c(vars_lev, vars_factor, vars_additional, vars_interactions, vars_amenities_upd),collapse = " + "))
+postlasso_ols <- ols_modeller(lin_postlasso_model)
+
+postlasso_size <- length(vars_lev) + length(vars_factor) + length(vars_additional) + length(vars_interactions) + length(vars_amenities_upd)
+
+resamples(
+  list(
+    ols_lev5 = ols_results[[5]],
+    lasso_model = lasso_model,
+    postlasso_ols = postlasso_ols
+  )
+) %>% summary()
+
+postlasso_bic <- get_bic_lin(postlasso_ols, postlasso_size)
+
+BICs <- rbind(BICs, matrix(c(c("post_lasso_OLS"), postlasso_bic), nrow = 1, ncol = 2))
+
+BICs # post-LASSO OLS is close to lin5 model
+```
+
+The BIC score is marginally worse than the original linear model, but we see improvements in the RMSE compared to the original linear model.
+
+## Moving to CART
+Due to the resource intensity we only estimate one CART model with 7 levels, which we also visualise below.
+
+```{r CART, echo=T, error=F, warning=F}
+cart_model_name <- ols_models[[5]]
+
+cart_modeller <- function(x, y){
+  sys_time_start <- Sys.time()
+  
+  set.seed(42)
+  cart_model <- train(
+    formula(as.character(x)),
+    data = data_train,
+    method = "rpart",
+    tuneLength = y,
+    trControl = train_control
+  )
+  sys_time_end <- Sys.time()
+  print(difftime(sys_time_end, sys_time_start))
+  return(cart_model)
+}
+
+cart_model <- cart_modeller(cart_model_name, 7)
+
+fancyRpartPlot(cart_model$finalModel, sub = "")
+
+resamples(
+  list(
+    ols_lev5 = ols_results[[5]],
+    lasso_model = lasso_model,
+    postlasso_ols = postlasso_ols,
+    cart_model = cart_model
+  )
+) %>% summary()
+
+cart_bic <- get_bic_lin(cart_model, all_sizes[5])
+
+BICs <- rbind(BICs, matrix(c(c("CART_model"), cart_bic), nrow = 1, ncol = 2))
+
+BICs # CART model is inferior to the previous models in BIC score
+```
+
+As expected, the CART model is inferior in both RMSE and BIC, which shows us that CARt is not the best prediction tool.
+
+## Next step is random forest
+We turn now to random forest, where we also run only one model, given that it's time and resource intense.
+
+```{r random forest, echo=T}
+randomforest_size <- length(vars_lev) + length(vars_factor) + length(vars_additional) + length(vars_interactions) + length(vars_amenities)
+
+random_forester <- function(mtr1, mtr2, node_size, model){
+  sys_time_start <- Sys.time()
+  tune_grid <- expand.grid(
+    .mtry = mtr1:mtr2,
+    .splitrule = "variance",
+    .min.node.size = node_size
+  )
+  
+  set.seed(42)
+  rf_model <- train(
+    formula(as.character(model)),
+    data = data_train,
+    method = "ranger",
+    trControl = train_control,
+    # mtry: cannot be more than the number of predictors 
+    tuneGrid = tune_grid,
+    importance = "impurity"
+  )
+  sys_time_end <- Sys.time()
+  print(difftime(sys_time_end, sys_time_start))
+  return(rf_model)
+}
+
+rf_model <- random_forester(1, 3, c(5), ols_models[[5]])
+
+plot(varImp(rf_model))
+
+resamples(
+  list(
+    ols_lev5 = ols_results[[5]],
+    lasso_model = lasso_model,
+    postlasso_ols = postlasso_ols,
+    cart_model = cart_model,
+    rf_model = rf_model
+  )
+) %>% summary()
+
+randomforest_bic <- get_bic_lin(rf_model, randomforest_size)
+
+BICs <- rbind(BICs, matrix(c(c("random_forest"), randomforest_bic), nrow = 1, ncol = 2))
+
+BICs # post-LASSO OLS is close to lin5 model
+
+```
+
+The random forest model produced much better BIC, and also superior RMSE, thus this will be our final model. Furthermore, we can see that accomodates and room types are the most important variables on a relative basis.
+
+## Choosing the final model and making predictions on the Hackney data
+As mentioned above, we choose the random forest model as our final model. We estimate the final coefficients on the total dataset including the holdout dataset as well. Then as a last step we do predictions on the Hackney dataset.
+
+```{r modelling, echo=FALSE}
+final_model_size <- length(vars_lev) + length(vars_factor) + length(vars_additional) + length(vars_interactions) + length(vars_amenities)
+
+data_train <- london_data_cleaned # for the sake of simplicity we assign the dataset this way
+
+final_model <- random_forester(1, 3, c(5), ols_models[[5]]) # we run the final model to get the coefficients
+
+london_hackney_prediction <- london_hackney %>% 
+  mutate(predicted_price = predict(final_model, newdata = london_hackney))
+
+ggplot(data = london_hackney_prediction, aes(x = price, y = price - predicted_price)) +
+  geom_point(color = "blue", size = 1) +
+  theme_bw() +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  ggtitle("Hackney final model predicted vs actual") +
+  labs(x = "Price", t = "Price - predicted price") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggsave("task_A_final.png")
+
+final_model
+
+get_bic_lin(final_model, final_model_size)
+```
+
+It is visible from the above chart that our predictions are better at the lower price points and are shooting higher and higher over at the higher price points. Interestingly, the RMSE and the MAE are better than in the modelling part, but the BIC is worse.
+
+## Part B
+In the second part we do a similar analysis on Manchester. For this analysis we decided to include the whole of London and Bristol in the dataset. The underlying idea was to find a city besides London that closely matches Manchester, based on GVA per head (https://en.wikipedia.org/wiki/List_of_UK_cities_by_GVA) and is also in the UK. Out of the available Airbnb datasets Bristol was the closest. We decided to include all the districts from each cities, assuming that the variations between poorer and richer areas could show some similarities in these cities.
+
+## Loading data 
+Again, we start with filtering for the business requirements, which are 1-6 guests and apartment as property type. We also check the variables in the dataset, and select only those, which are present in all.
+
+```{r loading data_B, results="hide"}
+london_data_raw <- read.csv('london_listings.csv')
+man_data_raw <- read.csv('manchester.csv')
+bristol_data_raw <- read.csv('bristol.csv')
+
+sort(unique(colnames(london_data_raw))) == sort(unique(colnames(man_data_raw))) # Need to check this
+sort(unique(colnames(london_data_raw))) == sort(unique(colnames(bristol_data_raw))) # This is good to go
+
+names_to_select <- sort(unique(colnames(london_data_raw)))[sort(unique(colnames(london_data_raw))) %in% sort(unique(colnames(man_data_raw)))]
+
+london_data_raw <- london_data_raw %>% select(one_of(names_to_select)) %>% mutate(city_fct = as.factor("London")) 
+
+man_data_raw <- man_data_raw %>% select(one_of(names_to_select)) %>% mutate(city_fct = as.factor("Manchester"))
+
+bristol_data_raw <- bristol_data_raw %>% select(one_of(names_to_select)) %>% mutate(city_fct = as.factor("Bristol")) 
+
+all_city_data <- rbind(london_data_raw, man_data_raw)
+all_city_data <- rbind(all_city_data, bristol_data_raw)
+
+all_city_data <- all_city_data %>% filter(accommodates < 7) 
+
+property_types <- all_city_data %>% # we will keep Apartment, Serviced apartment, Condominium, and Loft
+  group_by(property_type) %>% 
+  summarize(count = n()) %>% 
+  arrange(-count) 
+
+rm(property_types)
+
+all_city_data <- all_city_data %>% filter(property_type %in% c("Apartment", "Serviced apartment", "Condominium", "Loft")) 
+
+write_csv(all_city_data, "all_city_data.csv")
+```
+
+## Dataset cleaning
+As the next step we move to cleaning the data via converting variables to proper types and selecting only what could have relevence for the model. The most important steps in the below code chunk include:
+1) Intitial selection of variables based on domain knowledge.
+2) Transforming the amenities into variables.
+3) Transforming certain variables into proper dummies.
+4) Checking NAs in the dataset and making further adjusments to variables with NA values. In the case of factor. variables in some cases we will take NA as a distinct value representing not disclosed, given that in these cases (e.g. review scores) the lack of disclosure can contain information for the customer and thus affect pricing.
+The process follows the same logic as in part A.
+
+```{r data cleaning 1_B, warning=F, error=F}
+#glimpse(all_city_data)
+
+all_city_data <- all_city_data %>% # selecting variables that seem to have relevance for the price, and is still available
+  select(id, host_response_time, host_has_profile_pic, host_identity_verified,
+         neighbourhood_cleansed, property_type, room_type, accommodates, bathrooms, bedrooms, beds, bed_type, amenities, square_feet, price, security_deposit, cleaning_fee, minimum_nights, availability_30, availability_60, availability_90, availability_365, number_of_reviews, review_scores_rating, review_scores_accuracy, review_scores_cleanliness, review_scores_cleanliness, review_scores_checkin, review_scores_communication, review_scores_communication, review_scores_location, review_scores_value, requires_license, instant_bookable, cancellation_policy, require_guest_profile_picture, require_guest_phone_verification, city_fct)
+
+# Amenities need to be turned into proper dummies
+all_city_data <- all_city_data %>% 
+  mutate(amenities = as.character(amenities))
+
+all_city_data$amenities <- substring(all_city_data$amenities, 2, nchar(all_city_data$amenities)-1)
+
+all_city_data$amenities <- (strsplit(as.character((gsub('"', '', all_city_data$amenities))), ","))
+
+all_city_data_withdummies <- cbind(all_city_data, mtabulate(all_city_data$amenities))
+
+c <- colnames(all_city_data_withdummies) # We standardize the names for easy reference
+c <- c[37:length(c)]
+d <- paste("n", c, sep = "_")
+d <- gsub(" ", "_", d)
+d <- gsub("-", "_", d)
+d <- gsub("/", "_", d)
+d <- gsub(":", "_", d)
+d <- gsub("\\(", "_", d)
+d <- gsub(")", "_", d)
+d <- gsub("’", "_", d)
+d <- gsub("\\.", "_", d)
+e <- c(colnames(all_city_data_withdummies)[0:36], d)
+
+colnames(all_city_data_withdummies) <- e
+
+filter_amen <- paste(d, "<=", 1)
+
+#sapply(select(all_city_data_withdummies, contains("n_"), -contains("cancellation_policy")), function (x) sum(ifelse(x > 1, 1, 0)))
+
+all_city_data_withdummies_upd <- all_city_data_withdummies
+
+for (i in 1:length(filter_amen)){
+  all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% 
+    filter(eval(parse(text = filter_amen[i])))
+}
+
+amenities <- sort(sapply(select(all_city_data_withdummies_upd, 
+                                contains("n_"), -contains("cancellation_policy")), 
+                         function(x) sum(x)) / nrow(all_city_data_withdummies_upd) * 100) 
+
+sel_amenities <- amenities[(amenities > 5 & amenities < 95)] # excluding variables that over or underrepresented
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>%
+  select(one_of(c(colnames(all_city_data), names(sel_amenities))), -amenities, -contains("translation_missing")) 
+
+#sapply(select(all_city_data_withdummies_upd, contains("n_"), -contains("cancellation_policy")), function (x) sum(ifelse(x > 1, 1, 0)))
+
+#glimpse(all_city_data_withdummies_upd)
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% 
+  mutate(price = as.integer(substring(price, 2)),
+         security_deposit = as.integer(substring(security_deposit, 2)),
+         cleaning_fee = as.integer(substring(cleaning_fee, 2)),
+         requires_license = as.integer(ifelse(requires_license == "f", 0, ifelse(requires_license == "t", 1, "NA"))),
+         instant_bookable = as.integer(ifelse(instant_bookable == "f", 0, ifelse(instant_bookable == "t", 1, "NA"))),
+         require_guest_profile_picture = as.integer(ifelse(require_guest_profile_picture == "f", 0, ifelse(require_guest_profile_picture == "t", 1, "NA"))),
+         require_guest_phone_verification = as.integer(ifelse(require_guest_phone_verification == "f", 0, ifelse(require_guest_phone_verification == "t", 1, "NA"))))
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% filter(price > 0) # keeping only data with non-zero price
+
+### Check for NAs
+to_filter <- sapply(all_city_data_withdummies_upd, function(x) sum(is.na(x)))
+to_filter[to_filter > 0] # it seems like there are many NAs in review scores, security deposit and cleaning fee; 
+# NAs in bathrooms, bedrooms, beds will be dropped, square feet will not be used
+
+all_city_data_withdummies_upd %>% mutate(review_scores_aggreg = 1/6 * (review_scores_accuracy +
+                                                                       review_scores_cleanliness +
+                                                                       review_scores_checkin +
+                                                                       review_scores_communication +
+                                                                       review_scores_location +
+                                                                       review_scores_value),
+                                       has_review_score = ifelse(review_scores_aggreg == "NA", 0, 1)) %>%
+  group_by(has_review_score) %>%
+  summarize(price = mean(price, na.rm = T), count = n()) # it seems that could be a difference based on the presence of review scores in price
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% mutate(review_scores_aggreg = 1/6 * (review_scores_accuracy +
+review_scores_cleanliness +
+review_scores_checkin +
+review_scores_communication +
+review_scores_location +
+review_scores_value))
+
+summary(all_city_data_withdummies_upd$review_scores_aggreg) # seems like the distribution has a long left tail
+
+all_city_data_withdummies_upd %>% mutate(has_cleaning_fee = ifelse(cleaning_fee == "NA", 0, 1)) %>%
+  group_by(has_cleaning_fee) %>%
+  summarize(price = mean(price, na.rm = T), count = n()) # interestingly an extra cleaning fee means higher price for the listing
+
+summary(all_city_data_withdummies_upd$cleaning_fee) # will use this for the factor variable
+
+all_city_data_withdummies_upd %>% mutate(has_security_deposit = ifelse(security_deposit == "NA", 0, 1)) %>%
+  group_by(has_security_deposit) %>%
+  summarize(price = mean(price, na.rm = T), count = n()) # the places with security deposit also seem to have a higher price
+
+summary(all_city_data_withdummies_upd$security_deposit) # will use this for the factor variable
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% 
+  mutate(review_scores_fact = cut(review_scores_aggreg, c(0, 9.333, 9.667, 9.75, Inf), c("bad", "below average", "above average", "good")), # scores turned into factors
+         cleaning_fee_fact = cut(cleaning_fee, c(0, 18, 30, 60, Inf), c("low", "below average", "above average", "high")),
+         security_deposit_fact = cut(security_deposit, c(0, 100, Inf), c("below average", "above average")),
+         availability_aggreg = cut(1/4 * (availability_30 / 30 + availability_60 / 60 + availability_90 / 90 + availability_365 / 365), c(0, 0.25, 0.5, 0.75, Inf), c("low", "below average", "above average", "high"))) # availability turned into one variable that favours imminent availability
+
+#glimpse(all_city_data_withdummies_upd)
+
+# we believe that the missing values for the following factors contain information relevant for price, thus we rephrase them into factor values
+
+all_city_data_withdummies_upd$review_scores_fact <- as.character(all_city_data_withdummies_upd$review_scores_fact)
+all_city_data_withdummies_upd$review_scores_fact[is.na(all_city_data_withdummies_upd$review_scores_fact) == 1] <- "no reviews"
+all_city_data_withdummies_upd$review_scores_fact <- as.factor(all_city_data_withdummies_upd$review_scores_fact)
+
+all_city_data_withdummies_upd$cleaning_fee_fact <- as.character(all_city_data_withdummies_upd$cleaning_fee_fact)
+all_city_data_withdummies_upd$cleaning_fee_fact[is.na(all_city_data_withdummies_upd$cleaning_fee_fact) == 1] <- "no fee"
+all_city_data_withdummies_upd$cleaning_fee_fact <- as.factor(all_city_data_withdummies_upd$cleaning_fee_fact)
+
+all_city_data_withdummies_upd$security_deposit_fact <- as.character(all_city_data_withdummies_upd$security_deposit_fact)
+all_city_data_withdummies_upd$security_deposit_fact[is.na(all_city_data_withdummies_upd$security_deposit_fact) == 1] <- "no fee"
+all_city_data_withdummies_upd$security_deposit_fact <- as.factor(all_city_data_withdummies_upd$security_deposit_fact)
+
+all_city_data_withdummies_upd$availability_aggreg <- as.character(all_city_data_withdummies_upd$availability_aggreg)
+all_city_data_withdummies_upd$availability_aggreg[is.na(all_city_data_withdummies_upd$availability_aggreg) == 1] <- "not disclosed"
+all_city_data_withdummies_upd$availability_aggreg <- as.factor(all_city_data_withdummies_upd$availability_aggreg)
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% # dropping other NA values
+  filter(is.na(bathrooms) == 0 & is.na(bedrooms) == 0 & is.na(beds) == 0 & is.na(price) == 0) 
+
+write_csv(all_city_data_withdummies_upd, "all_city_data_withdummies_upd.csv")
+```
+
+## Further cleaning steps
+Same as in part A, we continue cleaning with the other factor variables and doing additional transformations and new variable creation based distributions. As a last cleaning step we separate the dataset into two parts with the first part including Manchester, and the second part with the remaining data (London and Bristol).
+
+```{r data cleaning 2_B, warning=F, error=F}
+#all_city_data_withdummies_upd %>% 
+#  select_if(is.factor) %>% 
+#  skim() # taking a quick look of all the factor variables
+
+all_city_data_withdummies_upd %>% 
+  group_by(bed_type) %>% 
+  summarize(count = n()) # we will not use bed_type as a variable given that there is not much variation (1% is non real bed)
+
+all_city_data_withdummies_upd %>% 
+  group_by(cancellation_policy) %>% 
+  summarize(count = n()) # we will group up the strict categories into one category
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% 
+  mutate(cancellation_policy = as.factor(ifelse(cancellation_policy == "flexible", "flexible", ifelse(cancellation_policy == "moderate", "moderate", "strict"))))
+
+# we will not use host_has_profile_pic given that it's almost all true
+
+# host_identity_verified needs to be turned into a dummy
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% 
+  mutate(host_identity_verified = as.integer(ifelse(host_identity_verified == "t", 1, 0)))
+
+all_city_data_withdummies_upd %>% 
+  group_by(host_response_time) %>% 
+  summarize(count = n()) %>% 
+  arrange(-count) # we will compile this in fewer groups for the sake of simplicity, assuming a difference between rapid and non-rapid response and no-response (N/A)
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% 
+  mutate(host_response_time = as.factor(ifelse(host_response_time == "N/A", "N/A", ifelse(host_response_time == "within an hour", "less than an hour", "more than an hour")))) # we include empties in the last category
+
+#glimpse(all_city_data_withdummies_upd)
+
+length(all_city_data_withdummies_upd$beds[all_city_data_withdummies_upd$beds == 0 | all_city_data_withdummies_upd$bathrooms == 0.0]) # we will take out the observations with 0 beds and 0 bathrooms as they are hard to interpret
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% filter(beds != 0 & bathrooms != 0.0)
+
+hist(all_city_data_withdummies_upd$bathrooms) # transform it into categories 1/2/3/3+
+#sort(unique(all_city_data_withdummies_upd$bathrooms))
+
+hist(all_city_data_withdummies_upd$accommodates) # add a log variable as well
+
+hist(all_city_data_withdummies_upd$bedrooms) # transform it into categories 0/1/2/2+
+
+hist(all_city_data_withdummies_upd$beds) # add a log variable as well
+
+hist(all_city_data_withdummies_upd$price) # add a log variable as well
+
+hist(all_city_data_withdummies_upd$minimum_nights) # more than 30 minimum nights seem too much so we drop those and turn into categories 1/3/7/7+
+#sort(unique(all_city_data_withdummies_upd$minimum_nights))
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% filter(minimum_nights < 15)
+
+all_city_data_withdummies_upd <- all_city_data_withdummies_upd %>% mutate(bathrooms = cut(bathrooms, c(0,1,2,3,Inf), c("1", "1-2", "2-3", "3+")),
+                                                                      bedrooms = cut(bedrooms, c(-Inf,0,1,2,Inf), c("0", "0-1", "1-2", "2+")),
+                                                                      ln_price = log(price),
+                                                                      ln_beds = log(beds),
+                                                                      ln_accommodates = log(accommodates),
+                                                                      minimum_nights = cut(minimum_nights, c(0,1,3,7, Inf), c("1", "1-3", "3-7", "7+")))
+
+sapply(select(all_city_data_withdummies_upd, requires_license, instant_bookable, require_guest_profile_picture, require_guest_phone_verification), function (x) sum(x)) # we will keep only instant bookable
+
+#sort(sapply(select(all_city_data_withdummies_upd, # checking again for amenities with too high or too low share
+#                  contains("n_"), -contains("cancellation_policy"), -ln_price, -ln_accommodates), 
+#            function(x) sum(x)) / nrow(all_city_data_withdummies_upd) * 100) # nothing further to take out just Other
+
+all_city_data_cleaned <- all_city_data_withdummies_upd %>% 
+  select(id,starts_with("host"),-host_has_profile_pic, room_type, accommodates, ln_accommodates, bathrooms, bedrooms, beds, ln_beds, price, ln_price, minimum_nights, instant_bookable, cancellation_policy, review_scores_fact, cleaning_fee_fact, security_deposit_fact, availability_aggreg, starts_with("n_"), -n_Other, city_fct )
+
+write_csv(all_city_data_cleaned, "all_city_data_cleaned.csv")
+
+manchester_data <- all_city_data_cleaned %>% filter(city_fct == "Manchester")
+
+write_csv(manchester_data, "manchester_data_cleaned.csv")
+
+all_city_ex_manchester <- all_city_data_cleaned %>% filter(city_fct != "Manchester")
+
+write_csv(all_city_ex_manchester, "all_city_ex_manchester_cleaned.csv")
+```
+
+## Modelling ##
+Now we move to modelling and prediction phase. Again, in this part we estimate OLS, LASSO, post-LASSO OLS, CART and random forest models, select the best model based on RMSE and use it to forecast prices in Hackney.
+
+## Modell setup ##
+First we select the variables and set the training/test set and cross validation parameters.
+```{r model setup_B, warning=F, error=F}
+#glimpse(all_city_ex_manchester)
+
+p1 <- price_diff_by_variables(all_city_ex_manchester, "room_type", "n_Long_term_stays_allowed")
+p2 <- price_diff_by_variables(all_city_ex_manchester, "review_scores_fact", "n_Heating")
+p3 <- price_diff_by_variables(all_city_ex_manchester, "host_response_time", "n_Host_greets_you")
+p4 <- price_diff_by_variables(all_city_ex_manchester, "cancellation_policy", "n_24_hour_check_in")
+
+grid.arrange(p1, p2, p3, p4, ncol=2, nrow=2) # based on this we will include the interaction between room type and long term stay, as well as cancellation and 24 hour check-in, same as in the first part
+
+vars_lev <- c("accommodates", "beds")
+vars_log <- c("ln_accommodates", "ln_beds")
+vars_factor <- c("room_type", "bathrooms", "bedrooms", "minimum_nights", "cancellation_policy")
+vars_additional <- c("host_response_time", "host_identity_verified", "review_scores_fact", "cleaning_fee_fact", "security_deposit_fact", "availability_aggreg", "instant_bookable")
+vars_amenities <- names(all_city_ex_manchester)[startsWith(names(all_city_ex_manchester), "n_")]
+vars_interactions <- c("room_type * n_Long_term_stays_allowed", "cancellation_policy * n_24_hour_check_in")
+model_prefix <- c("price ", "ln_price")
+
+lev1model <- paste0("price ~ ",paste(vars_lev,collapse = " + "))
+lev2model <- paste0("price ~ ",paste(c(vars_lev, vars_factor),collapse = " + "))
+lev3model <- paste0("price ~ ",paste(c(vars_lev, vars_factor, vars_additional),collapse = " + "))
+lev4model <- paste0("price ~ ",paste(c(vars_lev, vars_factor, vars_additional, vars_interactions),collapse = " + "))
+lev5model <- paste0("price ~ ",paste(c(vars_lev, vars_factor, vars_additional, vars_interactions, vars_amenities),collapse = " + "))
+lev_models <- as.list(c(lev1model, lev2model, lev3model, lev4model, lev5model))
+
+log1model <- paste0("ln_price ~ ",paste(vars_log,collapse = " + "))
+log2model <- paste0("ln_price ~ ",paste(c(vars_log, vars_factor),collapse = " + "))
+log3model <- paste0("ln_price ~ ",paste(c(vars_log, vars_factor, vars_additional),collapse = " + "))
+log4model <- paste0("ln_price ~ ",paste(c(vars_log, vars_factor, vars_additional, vars_interactions),collapse = " + "))
+log5model <- paste0("ln_price ~ ",paste(c(vars_log, vars_factor, vars_additional, vars_interactions, vars_amenities),collapse = " + "))
+log_models <- as.list(c(log1model, log2model, log3model, log4model, log5model))
+
+ols_models <- c(lev_models, log_models)
+
+basic_models <- length(vars_lev)
+adv1_models <- basic_models + length(vars_factor)
+adv2_models <- adv1_models + length(vars_additional)
+adv3_models <- adv2_models + length(vars_interactions)
+full_models <- adv3_models + length(vars_amenities)
+all_sizes <- c(basic_models, adv1_models, adv2_models, adv3_models, full_models)
+
+### Defining train and test datasets and cross-validation
+set.seed(42)
+train_indices <- createDataPartition(all_city_ex_manchester$price, p = 0.8, list = FALSE) # we do the below on the dataset that does not contain Manchester
+data_train <- all_city_ex_manchester[train_indices, ] 
+data_holdout <- all_city_ex_manchester[-train_indices, ]
+
+train_control <- trainControl(method = "cv", number = 10, verboseIter = F) # setting cross-validation to 10-fold
+```
+
+## Start with OLS
+We use the formula defined in part A to do the modelling.
+
+```{r OLS_B, echo=T}
+ols_results <- NULL
+ols_log_extra <- NULL
+ols_results <- as.list(ols_results)
+ols_log_extra <- as.list(ols_log_extra)
+y <- 1
+
+for (i in 1:length(ols_models)){
+  sys_time_start <- Sys.time()
+  ols_results[[i]]<- ols_modeller(ols_models[[i]])
+  if (startsWith(as.character(ols_models[[i]]), "ln") == 1){
+    ols_log_extra[[y]] <- ols_logs(ols_results[[i]])
+    y <- y + 1
+    #print(y)
+  }
+  sys_time_end <- Sys.time()
+  print(difftime(sys_time_end, sys_time_start))
+}
+
+ols_log_extra <- data.frame(matrix(unlist(ols_log_extra), nrow=5, byrow=T))
+colnames(ols_log_extra) <- c("MSE", "RMSE", "MAE")
+
+resamples(
+  list(
+    ols_lev1 = ols_results[[1]],
+    ols_lev2 = ols_results[[2]],
+    ols_lev3 = ols_results[[3]],
+    ols_lev4 = ols_results[[4]],
+    ols_lev5 = ols_results[[5]]
+  )
+) %>% summary()
+
+ols_log_extra
+
+BICs_lin <- NULL
+
+for (models in 1:5){
+  BICs_lin[models] <- get_bic_lin(ols_results[[models]], all_sizes[models])
+}
+
+BICs <- matrix(c(c("lin1", "lin2", "lin3", "lin4", "lin5"), BICs_lin), nrow = 5, ncol = 2)
+
+colnames(BICs) <- c("model_name", "BIC")
+
+BICs_log <- NULL
+
+for (models in 1:5){
+  BICs_log[models] <- get_bic_log(ols_results[[models + 5]], all_sizes[models])
+}
+
+BICs <- rbind(BICs, matrix(c(c("log1", "log2", "log3", "log4", "log5"), BICs_log), nrow = 5, ncol = 2))
+
+BICs # select best model which is lin5
+
+BICs <- BICs[5, ]
+```
+
+Based on the BIC values we choose the model #5 from the linear models. 
+
+## Continue with LASSO
+As the next step with continue with the LASSO function.
+
+```{r LASSO_B, echo=T}
+lasso_model_name <- ols_models[[5]]
+
+lasso_model <- lasso_modeller(lasso_model_name)
+
+resamples(
+  list(
+    ols_lev5 = ols_results[[5]],
+    lasso_model = lasso_model
+  )
+) %>% summary()
+
+lasso_bic <- get_bic_lin(lasso_model, all_sizes[5])
+
+BICs <- rbind(BICs, matrix(c(c("lasso"), lasso_bic), nrow = 1, ncol = 2))
+
+BICs # Lasso shows somewhat worse BIC score
+```
+
+The BIC score this time is again incrementally worse than the linear models, however we got the same RMSE.
+
+## Post-LASSO OLS 
+Now we move to the LASSO based OLS.
+
+```{r post-lasso OLS_B, echo=T}
+lasso_coeffs <- coef(
+  lasso_model$finalModel, 
+  lasso_model$bestTune$lambda) %>%
+  as.matrix() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "variable") %>% 
+  rename(coefficient = `1`)
+
+#print(lasso_coeffs) # we will add an additional linear regression model based on the coefficients 
+
+counter = 1
+vars_amenities_upd <- NULL
+
+for (names in (1:length(vars_amenities))){
+  if (vars_amenities[names] %in% c("n_Bathtub", "n_Dishes_and_silverware", "n_First_aid_kit", "n_Kitchen") == 0) {
+    vars_amenities_upd[counter] <- vars_amenities[names]
+    counter <- counter + 1
+  }
+}
+
+lin_postlasso_model <- paste0("price ~ ",paste(c(vars_lev, vars_factor, vars_additional, vars_amenities_upd),collapse = " + "))
+postlasso_ols <- ols_modeller(lin_postlasso_model)
+
+postlasso_size <- length(vars_lev) + length(vars_factor) + length(vars_additional) + length(vars_interactions) + length(vars_amenities_upd)
+
+resamples(
+  list(
+    ols_lev5 = ols_results[[5]],
+    lasso_model = lasso_model,
+    postlasso_ols = postlasso_ols
+  )
+) %>% summary()
+
+postlasso_bic <- get_bic_lin(postlasso_ols, postlasso_size)
+
+BICs <- rbind(BICs, matrix(c(c("post_lasso_OLS"), postlasso_bic), nrow = 1, ncol = 2))
+
+BICs # post-LASSO OLS is close to lin5 model, but somewhat higher
+```
+
+Surprisingly the post-LASSO OLS did not yield a better model in either RMSE or BIC.
+
+## Moving to CART
+We continue with the CART modelling function.
+
+```{r CART_B, echo=T, error=F, warning=F}
+cart_model_name <- ols_models[[5]]
+
+cart_model <- cart_modeller(cart_model_name, 7)
+
+fancyRpartPlot(cart_model$finalModel, sub = "")
+
+resamples(
+  list(
+    ols_lev5 = ols_results[[5]],
+    lasso_model = lasso_model,
+    postlasso_ols = postlasso_ols,
+    cart_model = cart_model
+  )
+) %>% summary()
+
+cart_bic <- get_bic_lin(cart_model, all_sizes[5])
+
+BICs <- rbind(BICs, matrix(c(c("CART_model"), cart_bic), nrow = 1, ncol = 2))
+
+BICs # CART model is inferior to the previous models in BIC score
+```
+
+Here the CART model is also inferior to the other models.
+
+## Next step is random forest
+Finally, we turn to the random forest model. As it can be seen from the below outputs, this is very resource intense compared to the previous methods, therefore we only run one random forest model.
+
+```{r random forest_B, echo=T}
+randomforest_size <- length(vars_lev) + length(vars_factor) + length(vars_additional) + length(vars_interactions) + length(vars_amenities)
+
+rf_model <- random_forester(1, 3, c(5), ols_models[[5]])
+
+plot(varImp(rf_model))
+
+resamples(
+  list(
+    ols_lev5 = ols_results[[5]],
+    lasso_model = lasso_model,
+    postlasso_ols = postlasso_ols,
+    cart_model = cart_model,
+    rf_model = rf_model
+  )
+) %>% summary()
+
+randomforest_bic <- get_bic_lin(rf_model, randomforest_size)
+
+BICs <- rbind(BICs, matrix(c(c("random_forest"), randomforest_bic), nrow = 1, ncol = 2))
+
+BICs # random forest is the best in BIC
+
+```
+
+As expected we got much better BIC and RMSE values compared to the other models. Here as well accomodates and room type have the highest relative importance.
+
+## Defining the final model and making predictions on the Hackney data
+
+We define our final model with the random forest model on the total dataset excluding Manchester to get the coefficients, which then we use to do predictions on the Manchester data.  The RMSE and the MAE are better than in the other models, while BIC is higher. 
+
+```{r modelling_B, echo=FALSE}
+final_model_size <- length(vars_lev) + length(vars_factor) + length(vars_additional) + length(vars_interactions) + length(vars_amenities)
+
+data_train <- all_city_ex_manchester # for the sake of simplicity we assign the dataset this way
+
+final_model <- random_forester(1, 3, c(5), ols_models[[5]]) # we run the final model to get the coefficients
+
+manchester_prediction <- manchester_data %>% 
+  mutate(predicted_price = predict(final_model, newdata = manchester_data))
+
+ggplot(data = manchester_prediction, aes(x = price, y = price - predicted_price)) +
+  geom_point(color = "blue", size = 1) +
+  theme_bw() +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  ggtitle("Manchester final model predicted vs actual") +
+  labs(x = "Price", t = "Price - predicted price") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggsave("task_B_final.png")
+
+final_model
+
+get_bic_lin(final_model, final_model_size)
+```
